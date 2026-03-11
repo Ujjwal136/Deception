@@ -40,6 +40,8 @@ class ManagingAgent:
         cust_match = re.search(r"cust\d{3}", lowered)
         if cust_match:
             customer_id = cust_match.group(0).upper()
+            if "detail" in lowered or "profile" in lowered or "record" in lowered:
+                return f"SELECT * FROM customers WHERE customer_id = '{customer_id}'"
             return f"SELECT customer_id, full_name, balance FROM customers WHERE customer_id = '{customer_id}'"
 
         if "balance" in lowered:
