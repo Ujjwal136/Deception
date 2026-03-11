@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI, HTTPException
 
 from agents import BankingDB, LLMAgent, ManagingAgent
@@ -20,6 +22,8 @@ from models.schemas import (
 
 
 app = FastAPI(title=settings.app_name)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("aegis")
 
 llm_agent = LLMAgent()
 db = BankingDB()
@@ -35,8 +39,11 @@ redactor_loaded = redactor.load()
 
 @app.post("/api/v1/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest) -> ChatResponse:
+    logger.info("[chat] session=%s prompt=%s", payload.session_id, payload.message)
     ingress = interceptor.ingress(payload.message, payload.session_id)
+    logger.info("[ingress] trace=%s verdict=%s", ingress["trace_id"], ingress["verdict"])
     if ingress["verdict"] == "BLOCKED":
+        logger.warning("[blocked] trace=%s threat=%s", ingress["trace_id"], ingress["threat_type"])
         return ChatResponse(
             trace_id=ingress["trace_id"],
             verdict="BLOCKED",
@@ -45,7 +52,9 @@ def chat(payload: ChatRequest) -> ChatResponse:
         )
 
     raw_db = managing_agent.execute_planned_query(ingress["sanitized_prompt"])
+    logger.info("[db] trace=%s rows=%d", ingress["trace_id"], len(raw_db))
     egress = interceptor.egress(ingress["trace_id"], payload.session_id, str(raw_db))
+    logger.info("[egress] trace=%s verdict=%s redactions=%s", ingress["trace_id"], egress["verdict"], egress["redactions"])
     synthesized = llm_agent.synthesize(egress["sanitized_payload"], payload.message)
 
     return ChatResponse(
