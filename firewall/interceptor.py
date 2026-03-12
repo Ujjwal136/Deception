@@ -18,10 +18,12 @@ class Interceptor:
         scan = self.sentinel.scan(prompt)
         if scan["is_threat"]:
             self.weilchain.commit(
-                trace_id=trace_id,
                 session_id=session_id,
                 event_type="BLOCK",
                 threat_type=scan["threat_type"],
+                layer_used="HEURISTIC",
+                confidence=scan["confidence"],
+                trace_id=trace_id,
             )
             return {
                 "trace_id": trace_id,
@@ -35,10 +37,15 @@ class Interceptor:
         verdict = "SUSPICIOUS" if prompt_redacted["redactions"] else "CLEAN"
         if verdict == "SUSPICIOUS":
             self.weilchain.commit(
-                trace_id=trace_id,
                 session_id=session_id,
                 event_type="REDACT",
                 threat_type="ingress_pii",
+                layer_used="NER+REGEX",
+                confidence=scan["confidence"],
+                encrypted_fields=prompt_redacted.get("encrypted_fields", []),
+                redacted_fields=[r for r in prompt_redacted["redactions"]
+                                 if r not in prompt_redacted.get("encrypted_fields", [])],
+                trace_id=trace_id,
             )
 
         return {
@@ -54,10 +61,15 @@ class Interceptor:
         verdict = "SUSPICIOUS" if result["redactions"] else "CLEAN"
         if verdict == "SUSPICIOUS":
             self.weilchain.commit(
-                trace_id=trace_id,
                 session_id=session_id,
                 event_type="REDACT",
                 threat_type="egress_pii",
+                layer_used="NER+REGEX",
+                confidence=1.0,
+                encrypted_fields=result.get("encrypted_fields", []),
+                redacted_fields=[r for r in result["redactions"]
+                                 if r not in result.get("encrypted_fields", [])],
+                trace_id=trace_id,
             )
         return {
             "trace_id": trace_id,

@@ -99,10 +99,20 @@ def ledger() -> list[dict]:
 
 @app.get("/api/v1/audit/verify/{trace_id}")
 def verify(trace_id: str) -> dict:
-    entries = [entry for entry in weilchain.get_all() if entry["trace_id"] == trace_id]
-    if not entries:
-        raise HTTPException(status_code=404, detail="trace_id not found")
-    return {"trace_id": trace_id, "valid": all(weilchain.verify(entry) for entry in entries)}
+    result = weilchain.verify(trace_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+@app.get("/api/v1/audit/stats")
+def audit_stats() -> dict:
+    return weilchain.stats()
+
+
+@app.get("/api/v1/audit/verify_all")
+def verify_all() -> dict:
+    return weilchain.verify_all()
 
 
 @app.get("/health", response_model=HealthResponse)
