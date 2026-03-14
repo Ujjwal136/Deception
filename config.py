@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     redactor_model_path: str = "firewall/aegis_redactor"
     ner_model_path: str = "redactor_ner_model.joblib"
 
-    database_path: str = "aegis.db"
+    database_path: str = "banking.db"
     weilchain_db_path: str = "weilchain.db"
 
 

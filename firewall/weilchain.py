@@ -10,6 +10,7 @@ erasure) because only hashes of event metadata are persisted.
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -54,11 +55,20 @@ class WeilEntry:
 class Weilchain:
     def __init__(self, db_path: str = "weilchain.db") -> None:
         self.db_path = db_path
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._bootstrap()
+        self._conn: sqlite3.Connection | None = None
+        use_memory = os.getenv("RENDER") == "true" or not os.getenv("DATABASE_URL")
+        if use_memory:
+            self._backend = "memory"
+            self._ledger: list[dict] = []
+        else:
+            self._backend = "sqlite"
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._bootstrap()
 
     def _bootstrap(self) -> None:
+        if self._conn is None:
+            return
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ledger (
@@ -115,25 +125,29 @@ class Weilchain:
             confidence=confidence,
         )
 
-        self._conn.execute(
-            "INSERT INTO ledger "
-            "(trace_id, session_id, event_type, threat_type, timestamp_utc, "
-            " weilchain_hash, encrypted_fields, redacted_fields, layer_used, confidence) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                entry.trace_id,
-                entry.session_id,
-                entry.event_type,
-                entry.threat_type,
-                entry.timestamp_utc,
-                entry.weilchain_hash,
-                ",".join(entry.encrypted_fields),
-                ",".join(entry.redacted_fields),
-                entry.layer_used,
-                entry.confidence,
-            ),
-        )
-        self._conn.commit()
+        if self._backend == "memory":
+            self._ledger.append(asdict(entry))
+        else:
+            assert self._conn is not None
+            self._conn.execute(
+                "INSERT INTO ledger "
+                "(trace_id, session_id, event_type, threat_type, timestamp_utc, "
+                " weilchain_hash, encrypted_fields, redacted_fields, layer_used, confidence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    entry.trace_id,
+                    entry.session_id,
+                    entry.event_type,
+                    entry.threat_type,
+                    entry.timestamp_utc,
+                    entry.weilchain_hash,
+                    ",".join(entry.encrypted_fields),
+                    ",".join(entry.redacted_fields),
+                    entry.layer_used,
+                    entry.confidence,
+                ),
+            )
+            self._conn.commit()
         return entry
 
     # ── internal row → dict helper ─────────────────────────────────────
@@ -148,6 +162,9 @@ class Weilchain:
 
     def get_all(self) -> list[dict]:
         """Returns all entries, most recent first."""
+        if self._backend == "memory":
+            return [dict(e) for e in reversed(self._ledger)]
+        assert self._conn is not None
         rows = self._conn.execute(
             "SELECT trace_id, session_id, event_type, threat_type, timestamp_utc, "
             "weilchain_hash, encrypted_fields, redacted_fields, layer_used, confidence "
@@ -157,6 +174,9 @@ class Weilchain:
 
     def get_by_session(self, session_id: str) -> list[dict]:
         """Returns all entries for a given session_id."""
+        if self._backend == "memory":
+            return [dict(e) for e in reversed(self._ledger) if e["session_id"] == session_id]
+        assert self._conn is not None
         rows = self._conn.execute(
             "SELECT trace_id, session_id, event_type, threat_type, timestamp_utc, "
             "weilchain_hash, encrypted_fields, redacted_fields, layer_used, confidence "
@@ -167,6 +187,12 @@ class Weilchain:
 
     def get_by_trace(self, trace_id: str) -> Optional[dict]:
         """Returns the single entry matching trace_id, or None."""
+        if self._backend == "memory":
+            for entry in reversed(self._ledger):
+                if entry["trace_id"] == trace_id:
+                    return dict(entry)
+            return None
+        assert self._conn is not None
         row = self._conn.execute(
             "SELECT trace_id, session_id, event_type, threat_type, timestamp_utc, "
             "weilchain_hash, encrypted_fields, redacted_fields, layer_used, confidence "
@@ -179,6 +205,9 @@ class Weilchain:
 
     def get_by_event_type(self, event_type: str) -> list[dict]:
         """Returns all entries of a given event_type."""
+        if self._backend == "memory":
+            return [dict(e) for e in reversed(self._ledger) if e["event_type"] == event_type]
+        assert self._conn is not None
         rows = self._conn.execute(
             "SELECT trace_id, session_id, event_type, threat_type, timestamp_utc, "
             "weilchain_hash, encrypted_fields, redacted_fields, layer_used, confidence "
@@ -349,11 +378,17 @@ if __name__ == "__main__":
 
     # 6. Corrupt one entry
     total += 1
-    wc._conn.execute(
-        "UPDATE ledger SET weilchain_hash = 'CORRUPTED' WHERE trace_id = ?",
-        (e1.trace_id,),
-    )
-    wc._conn.commit()
+    if wc._backend == "sqlite":
+        wc._conn.execute(
+            "UPDATE ledger SET weilchain_hash = 'CORRUPTED' WHERE trace_id = ?",
+            (e1.trace_id,),
+        )
+        wc._conn.commit()
+    else:
+        for item in wc._ledger:
+            if item["trace_id"] == e1.trace_id:
+                item["weilchain_hash"] = "CORRUPTED"
+                break
     va2 = wc.verify_all()
     ok = va2["tampered"] == 1 and e1.trace_id in va2["tampered_trace_ids"]
     passed += int(ok)

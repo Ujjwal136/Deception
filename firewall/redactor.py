@@ -4,11 +4,12 @@ import pickle
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from config import settings
 from firewall.fpe_engine import FPE_ENCRYPT_MAP
-from firewall.train_redactor import extract_features
+from training.train_redactor import extract_features
 
 
 @dataclass
@@ -53,6 +54,13 @@ class Redactor:
             self.ner_classes = set(data["classes"])
             return True
         except FileNotFoundError:
+            model_dir = Path(settings.redactor_model_path)
+            # Validate model directory structure so path mismatches are visible at startup.
+            required = ["config.json", "tokenizer.json"]
+            has_weights = (model_dir / "model.safetensors").exists() or (model_dir / "pytorch_model.bin").exists()
+            if model_dir.exists() and all((model_dir / name).exists() for name in required) and has_weights:
+                self.ner_model = None
+                return False
             self.ner_model = None
             return False
 

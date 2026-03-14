@@ -4,12 +4,13 @@ import math
 import pickle
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from config import settings
-from firewall.train_sentinel import SGDClassifier, vectorize
-from firewall.train_sentinel_b import MLP, vectorize_b
+from training.train_sentinel import SGDClassifier, vectorize
+from training.train_sentinel_b import MLP, vectorize_b
 
 
 THREAT_PATTERNS = {
@@ -59,7 +60,8 @@ class Sentinel:
 
     def _load_layer_a(self) -> bool:
         try:
-            with open(settings.sentinel_model_path, "rb") as f:
+            model_path = Path(settings.sentinel_model_path)
+            with model_path.open("rb") as f:
                 data = pickle.load(f)
             self.classifier = SGDClassifier.from_dict(data["classifier"])
             self.vocab = data["vocab"]
@@ -71,7 +73,8 @@ class Sentinel:
 
     def _load_layer_b(self) -> bool:
         try:
-            with open(settings.sentinel_b_model_path, "rb") as f:
+            model_path = Path(settings.sentinel_b_model_path)
+            with model_path.open("rb") as f:
                 data = pickle.load(f)
             self.mlp = MLP.from_dict(data["mlp"])
             self.vocab_b = data["vocab"]
