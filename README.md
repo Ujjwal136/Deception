@@ -141,6 +141,62 @@ Supports:
 - GET /docs
 - GET /
 
+## Response Contracts (Current)
+
+### GET /health
+
+Health now exposes both top-level status and component-level readiness used by the live demo checks.
+
+Example shape:
+
+```json
+{
+  "status": "ok",
+  "sentinel_loaded": true,
+  "redactor_loaded": true,
+  "sentinel": {
+    "layer_a": true,
+    "layer_b": true,
+    "status": "loaded"
+  },
+  "redactor": "loaded",
+  "banking_db": "ready",
+  "llm_agent": "ready",
+  "weilchain": {
+    "status": "online",
+    "backend": "weilchain_applet",
+    "sdk_available": true,
+    "key_configured": true,
+    "key_path": "...",
+    "error": ""
+  }
+}
+```
+
+### POST /api/v1/chat
+
+Chat responses include redaction/encryption metadata required by the frontend demo and audit validation.
+
+Example shape:
+
+```json
+{
+  "trace_id": "...",
+  "verdict": "CLEAN",
+  "response": "...sanitized answer...",
+  "answer": "...sanitized answer...",
+  "was_blocked": false,
+  "threat_type": "none",
+  "encrypted_fields": ["AADHAAR", "PAN", "ACCOUNT_NO"],
+  "redactions": ["AADHAAR", "PAN", "PERSON"]
+}
+```
+
+Notes:
+
+- `response` and `answer` are both sanitized through egress redaction.
+- Blocked prompts return `verdict="BLOCKED"`, `was_blocked=true`, and a safe refusal message.
+
 ## Example Requests
 
 ### Chat
@@ -265,6 +321,26 @@ Coverage focus includes:
 - egress redaction checks
 - tamper verification behavior
 - repeated customer query flow
+
+### Demo Readiness Snapshot (March 2026)
+
+Latest full end-to-end validation status:
+
+- Health check: PASS
+- Clean query path: PASS
+- Six demo scenarios: 6/6 PASS
+- Weilchain audit trail: PASS (`onchain=true` entries)
+- Tamper verification: PASS
+- FPE roundtrip checks: PASS
+- Sentinel benchmark: 8/8 attacks blocked, 5/5 clean allowed
+- Integration suite: 5/5 PASS
+- Frontend checks: PASS
+
+Operational notes from latest hardening:
+
+- Ingress audit commit is reserved for blocked requests.
+- Clean requests are audited on egress redaction commit.
+- Ledger entries now maintain unique `trace_id` per entry in demo flow.
 
 ## Deployment
 
