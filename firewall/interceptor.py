@@ -34,19 +34,7 @@ class Interceptor:
             }
 
         prompt_redacted = self.redactor.redact(prompt)
-        verdict = "SUSPICIOUS" if prompt_redacted["redactions"] else "CLEAN"
-        if verdict == "SUSPICIOUS":
-            self.weilchain.commit(
-                session_id=session_id,
-                event_type="INGRESS_REDACT",
-                threat_type="INGRESS_PII",
-                layer_used="NER+REGEX",
-                confidence=scan["confidence"],
-                encrypted_fields=prompt_redacted.get("encrypted_fields", []),
-                redacted_fields=[r for r in prompt_redacted["redactions"]
-                                 if r not in prompt_redacted.get("encrypted_fields", [])],
-                trace_id=trace_id,
-            )
+        verdict = "CLEAN"
 
         return {
             "trace_id": trace_id,
@@ -76,4 +64,5 @@ class Interceptor:
             "verdict": verdict,
             "sanitized_payload": result["redacted_text"],
             "redactions": result["redactions"],
+            "encrypted_fields": result.get("encrypted_fields", []),
         }

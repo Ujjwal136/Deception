@@ -14,6 +14,10 @@ class ChatResponse(BaseModel):
     trace_id: str
     verdict: Verdict
     response: str
+    answer: str = ""
+    was_blocked: bool = False
+    threat_type: str = "none"
+    encrypted_fields: list[str] = Field(default_factory=list)
     redactions: list[str] = Field(default_factory=list)
 
 
@@ -57,3 +61,7 @@ class HealthResponse(BaseModel):
     sentinel_loaded: bool
     redactor_loaded: bool
     weilchain: dict[str, Any] = Field(default_factory=dict)
+    sentinel: dict[str, Any] = Field(default_factory=dict)
+    redactor: Any = False
+    banking_db: str = "unknown"
+    llm_agent: str = "unknown"

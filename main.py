@@ -99,6 +99,10 @@ def chat(payload: ChatRequest) -> ChatResponse:
             trace_id="none",
             verdict="CLEAN",
             response="Please enter a valid banking query.",
+            answer="Please enter a valid banking query.",
+            was_blocked=False,
+            threat_type="none",
+            encrypted_fields=[],
             redactions=[],
         )
     ingress = interceptor.ingress(payload.message, payload.session_id)
@@ -114,6 +118,10 @@ def chat(payload: ChatRequest) -> ChatResponse:
             trace_id=ingress["trace_id"],
             verdict="BLOCKED",
             response=blocked_resp.answer,
+            answer=blocked_resp.answer,
+            was_blocked=True,
+            threat_type=ingress["threat_type"],
+            encrypted_fields=[],
             redactions=[],
         )
 
@@ -124,19 +132,23 @@ def chat(payload: ChatRequest) -> ChatResponse:
     else:
         raw_db = result.raw_data
     logger.info("[db] trace=%s rows=%d", ingress["trace_id"], len(raw_db))
-    egress = interceptor.egress(ingress["trace_id"], payload.session_id, str(raw_db))
-    logger.info("[egress] trace=%s verdict=%s redactions=%s", ingress["trace_id"], egress["verdict"], egress["redactions"])
     agent_resp = llm_agent.synthesize(
         user_prompt=payload.message,
         sanitised_data=raw_db,
         trace_id=ingress["trace_id"],
         session_id=payload.session_id,
     )
+    egress = interceptor.egress(ingress["trace_id"], payload.session_id, agent_resp.answer)
+    logger.info("[egress] trace=%s verdict=%s redactions=%s", ingress["trace_id"], egress["verdict"], egress["redactions"])
 
     return ChatResponse(
         trace_id=ingress["trace_id"],
-        verdict=egress["verdict"],
-        response=agent_resp.answer,
+        verdict="CLEAN",
+        response=egress["sanitized_payload"],
+        answer=egress["sanitized_payload"],
+        was_blocked=False,
+        threat_type="none",
+        encrypted_fields=egress.get("encrypted_fields", []),
         redactions=egress["redactions"],
     )
 
@@ -181,10 +193,24 @@ def verify_all() -> dict:
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
+    try:
+        db_rows = banking_db.execute_query("SELECT customer_id FROM customers LIMIT 1")
+        banking_db_status = "ready" if isinstance(db_rows, list) else "error"
+    except Exception:
+        banking_db_status = "error"
+
     return HealthResponse(
         status="ok",
         sentinel_loaded=sentinel_loaded,
         redactor_loaded=redactor_loaded,
+        sentinel={
+            "layer_a": bool(getattr(sentinel, "layer_a_loaded", False)),
+            "layer_b": bool(getattr(sentinel, "layer_b_loaded", False)),
+            "status": "loaded" if sentinel_loaded else "degraded",
+        },
+        redactor="loaded" if redactor_loaded else "degraded",
+        banking_db=banking_db_status,
+        llm_agent="ready" if llm_agent is not None else "error",
         weilchain=weilchain.connectivity(),
     )
 

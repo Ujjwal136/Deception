@@ -165,3 +165,35 @@ FPE_DECRYPT_MAP: dict[str, callable] = {
     "PHONE": decrypt_phone,
     "IFSC": decrypt_ifsc,
 }
+
+
+class FPEEngine:
+    """Compatibility wrapper for entity-aware FPE encrypt/decrypt calls."""
+
+    def encrypt(self, value: str, entity_type: str) -> str:
+        et = (entity_type or "").upper().strip()
+        fn = FPE_ENCRYPT_MAP.get(et)
+        if fn is None:
+            return value
+
+        encrypted = fn(value)
+        if et == "AADHAAR" and not value.__contains__(" ") and not encrypted.startswith("["):
+            return re.sub(r"\s", "", encrypted)
+        if et == "PHONE" and not value.strip().startswith("+") and not encrypted.startswith("["):
+            digits = re.sub(r"\D", "", encrypted)
+            return digits[-10:]
+        return encrypted
+
+    def decrypt(self, value: str, entity_type: str) -> str:
+        et = (entity_type or "").upper().strip()
+        fn = FPE_DECRYPT_MAP.get(et)
+        if fn is None:
+            return value
+
+        decrypted = fn(value)
+        if et == "AADHAAR" and not value.__contains__(" "):
+            return re.sub(r"\s", "", decrypted)
+        if et == "PHONE" and not value.strip().startswith("+"):
+            digits = re.sub(r"\D", "", decrypted)
+            return digits[-10:]
+        return decrypted

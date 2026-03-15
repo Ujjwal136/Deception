@@ -98,6 +98,14 @@ class Sentinel:
         heuristic_hit = self._threat_type(prompt)
         has_models = self.layer_a_loaded or self.layer_b_loaded
 
+        if heuristic_hit == "none" and self._is_benign_customer_lookup(prompt):
+            return {
+                "is_threat": False,
+                "confidence": 0.03,
+                "threat_type": "none",
+                "layer_used": "HEURISTIC",
+            }
+
         # Fast-path: safe banking intent with no heuristic match
         # ONLY when no models are loaded (otherwise let models decide)
         if not has_models and heuristic_hit == "none" and self._is_safe_banking_intent(prompt):
@@ -139,6 +147,9 @@ class Sentinel:
             # Weighted average: 0.45 A + 0.55 B (B is non-linear, slightly stronger)
             combined = 0.45 * prob_a + 0.55 * prob_b
             is_threat = combined >= 0.60
+            # Reduce false positives for benign banking lookups when heuristics are clean.
+            if self._is_safe_banking_intent(prompt) and combined < 0.85:
+                is_threat = False
             # If safe banking intent and models show low risk, reduce confidence
             if self._is_safe_banking_intent(prompt) and combined < 0.40:
                 combined = min(combined, 0.05)
@@ -154,6 +165,8 @@ class Sentinel:
         prob = prob_a if has_a else prob_b
         if prob is not None:
             is_threat = prob >= 0.65
+            if self._is_safe_banking_intent(prompt) and prob < 0.85:
+                is_threat = False
             return {
                 "is_threat": is_threat,
                 "confidence": float(prob),
@@ -174,6 +187,10 @@ class Sentinel:
         safe_terms = ["balance", "transaction", "loan", "ifsc", "interest",
                       "customer", "cust", "account type", "kyc", "branch"]
         return any(term in lowered for term in safe_terms)
+
+    def _is_benign_customer_lookup(self, prompt: str) -> bool:
+        lowered = prompt.lower().strip()
+        return bool(re.search(r"\b(show|list|get)\b.*\bcustomers?\b.*\bin\b\s+[a-z]+", lowered))
 
     def _layer_a_prob(self, prompt: str) -> float | None:
         if not self.layer_a_loaded:

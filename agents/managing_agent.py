@@ -132,7 +132,7 @@ Database schema:
             cust_id = f"CUST{int(cust_match.group(1)):03d}"
             return json.dumps({
                 "sql": (
-                    "SELECT customer_id, full_name, account_type, balance, city, kyc_status "
+                    "SELECT customer_id, full_name, aadhaar, pan, account_no, ifsc, phone, account_type, balance, city, kyc_status "
                     f"FROM customers WHERE customer_id = '{cust_id}'"
                 ),
                 "reasoning": f"Looking up customer by id {cust_id}",

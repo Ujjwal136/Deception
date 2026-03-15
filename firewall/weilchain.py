@@ -24,15 +24,37 @@ from config import settings
 # from weil_wallet import PrivateKey, Wallet, WeilClient
 # Every security event committed on-chain via client.audit()
 
+_WEIL_IMPORT_ERROR = ""
 try:
     from weil_wallet import PrivateKey, Wallet, WeilClient
 
     WEIL_SDK_AVAILABLE = True
-except ImportError:
-    WEIL_SDK_AVAILABLE = False
+except ImportError as exc:
+    try:
+        # Fallback: import only core modules needed for audit signing/commit.
+        # This avoids optional mnemonic dependencies from package __init__.
+        from weil_wallet.wallet import PrivateKey, Wallet
+        from weil_wallet.client import WeilClient
+
+        WEIL_SDK_AVAILABLE = True
+    except ImportError as core_exc:
+        WEIL_SDK_AVAILABLE = False
+        _WEIL_IMPORT_ERROR = f"{exc}; core import failed: {core_exc}"
 
 
 logger = logging.getLogger("aegis")
+
+
+def _project_root() -> Path:
+    # firewall/weilchain.py -> project root is one level up
+    return Path(__file__).resolve().parents[1]
+
+
+def _resolve_key_path(path_from_config: str) -> Path:
+    key_path = Path(path_from_config)
+    if key_path.is_absolute():
+        return key_path
+    return _project_root() / key_path
 
 
 def _compute_hash(
@@ -75,11 +97,11 @@ class Weilchain:
         self._sdk_ready = False
         self._last_error: str = ""
         self._key_path = settings.weil_key_path or os.getenv("WEIL_KEY_PATH", "private_key.wc")
+        self._resolved_key_path = _resolve_key_path(self._key_path)
 
-        key_path = Path(self._key_path)
-        if WEIL_SDK_AVAILABLE and key_path.exists():
+        if WEIL_SDK_AVAILABLE and self._resolved_key_path.exists():
             try:
-                pk = PrivateKey.from_file(str(key_path))
+                pk = PrivateKey.from_file(str(self._resolved_key_path))
                 self._wallet = Wallet(pk)
                 self._sdk_ready = True
                 logger.info("WeilChain SDK ready ✅ - commits will go on-chain")
@@ -87,6 +109,10 @@ class Weilchain:
                 self._last_error = str(exc)
                 logger.warning("WeilChain SDK init failed: %s", exc)
         else:
+            if not WEIL_SDK_AVAILABLE:
+                self._last_error = _WEIL_IMPORT_ERROR or "weil_wallet import failed"
+            elif not self._resolved_key_path.exists():
+                self._last_error = f"key file not found: {self._resolved_key_path}"
             logger.warning(
                 "WeilChain SDK not configured. Place private_key.wc in project root or set WEIL_KEY_PATH. "
                 "Audit events will be computed but not persisted on-chain."
@@ -154,6 +180,9 @@ class Weilchain:
                 entry.batch_id = str(onchain_result.get("batch_id", ""))
                 entry.tx_idx = str(onchain_result.get("tx_idx", ""))
                 entry.onchain = True
+                # Keep an in-process mirror so /api/v1/audit/ledger can show
+                # recent on-chain commits without a chain query endpoint.
+                self._cache.append(asdict(entry))
                 logger.info(
                     "Committed on-chain ✅ block=%s batch=%s trace=%s",
                     entry.block_height,
@@ -219,12 +248,13 @@ class Weilchain:
         }
 
     def connectivity(self) -> dict:
-        key_exists = Path(self._key_path).exists()
+        key_exists = self._resolved_key_path.exists()
         return {
             "status": "online" if self._sdk_ready else "offline",
             "backend": "weilchain_applet",
             "sdk_available": WEIL_SDK_AVAILABLE,
             "key_configured": key_exists,
+            "key_path": str(self._resolved_key_path),
             "error": self._last_error or "",
         }
 
