@@ -24,6 +24,9 @@ class Settings(BaseSettings):
 
     database_path: str = "banking.db"
     weilchain_db_path: str = "weilchain.db"
+    weil_private_key: str = ""
+    weil_applet_address: str = ""
+    weil_bridge_path: str = "applet/bridge.js"
 
 
 settings = Settings()

@@ -1,0 +1,14 @@
+service AegisAudit {
+    mutate commit_event(
+        trace_id: string,
+        session_id: string,
+        event_type: string,
+        threat_type: string,
+        weilchain_hash: string,
+        timestamp: string
+    ) -> string
+
+    query get_all_entries() -> string
+    query verify_entry(trace_id: string) -> string
+    query get_stats() -> string
+}

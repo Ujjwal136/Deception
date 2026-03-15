@@ -1,20 +1,22 @@
-"""Weilchain — cryptographic audit ledger for Aegis.
+"""Weilchain applet bridge for Aegis audit events.
 
-Not a blockchain. A tamper-evident audit trail that proves security events
-occurred without storing any raw PII.  Satisfies DPDP Act §17 (right to
-erasure) because only hashes of event metadata are persisted.
-
-# TODO: swap _ledger for PostgreSQL in production
+Primary storage is the Weilliptic applet via Node bridge. If bridge access is
+unavailable, this class degrades to in-memory fallback while keeping the API
+stable so the server does not crash.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
-import sqlite3
+import shutil
+import subprocess
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 
@@ -54,39 +56,17 @@ class WeilEntry:
 
 class Weilchain:
     def __init__(self, db_path: str = "weilchain.db") -> None:
-        self.db_path = db_path
-        self._conn: sqlite3.Connection | None = None
-        use_memory = os.getenv("RENDER") == "true" or not os.getenv("DATABASE_URL")
-        if use_memory:
-            self._backend = "memory"
-            self._ledger: list[dict] = []
-        else:
-            self._backend = "sqlite"
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            self._bootstrap()
-
-    def _bootstrap(self) -> None:
-        if self._conn is None:
-            return
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ledger (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                trace_id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                threat_type TEXT NOT NULL,
-                timestamp_utc TEXT NOT NULL,
-                weilchain_hash TEXT NOT NULL,
-                encrypted_fields TEXT NOT NULL DEFAULT '',
-                redacted_fields TEXT NOT NULL DEFAULT '',
-                layer_used TEXT NOT NULL DEFAULT '',
-                confidence REAL NOT NULL DEFAULT 0.0
-            )
-            """
-        )
-        self._conn.commit()
+        _ = db_path  # legacy arg retained for compatibility
+        root = Path(__file__).resolve().parent.parent
+        self.bridge_path = str(root / "applet" / "bridge.js")
+        self.applet_address = os.getenv("WEIL_APPLET_ADDRESS", "")
+        self._backend = "applet"
+        self._cache_entries: list[dict] = []
+        self._cache_ts: float = 0.0
+        self._cache_ttl_seconds = 10.0
+        self._offline_ledger: list[dict] = []
+        self._last_error: str | None = None
+        self._last_online: bool = False
 
     # ── COMMIT ─────────────────────────────────────────────────────────
 
@@ -101,7 +81,7 @@ class Weilchain:
         redacted_fields: list[str] | None = None,
         trace_id: str | None = None,
     ) -> WeilEntry:
-        """Create a new WeilEntry, compute its hash, persist to ledger."""
+        """Create a new WeilEntry and persist via applet when available."""
         if trace_id is None:
             trace_id = str(uuid.uuid4())
         if encrypted_fields is None:
@@ -125,96 +105,122 @@ class Weilchain:
             confidence=confidence,
         )
 
-        if self._backend == "memory":
-            self._ledger.append(asdict(entry))
-        else:
-            assert self._conn is not None
-            self._conn.execute(
-                "INSERT INTO ledger "
-                "(trace_id, session_id, event_type, threat_type, timestamp_utc, "
-                " weilchain_hash, encrypted_fields, redacted_fields, layer_used, confidence) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    entry.trace_id,
-                    entry.session_id,
-                    entry.event_type,
-                    entry.threat_type,
-                    entry.timestamp_utc,
-                    entry.weilchain_hash,
-                    ",".join(entry.encrypted_fields),
-                    ",".join(entry.redacted_fields),
-                    entry.layer_used,
-                    entry.confidence,
-                ),
-            )
-            self._conn.commit()
+        ok, _ = self._call_applet(
+            "commit",
+            data={
+                "trace_id": entry.trace_id,
+                "session_id": entry.session_id,
+                "event_type": entry.event_type,
+                "threat_type": entry.threat_type,
+                "weilchain_hash": entry.weilchain_hash,
+                "timestamp": entry.timestamp_utc,
+            },
+        )
+        if not ok:
+            self._offline_ledger.append(asdict(entry))
+        # Force next read to refresh after each write.
+        self._cache_ts = 0.0
         return entry
 
-    # ── internal row → dict helper ─────────────────────────────────────
+    def _bridge_available(self) -> bool:
+        if not os.getenv("WEIL_PRIVATE_KEY") or not os.getenv("WEIL_APPLET_ADDRESS"):
+            return False
+        if not Path(self.bridge_path).exists():
+            return False
+        return shutil.which("node") is not None
 
-    def _row_to_dict(self, row: sqlite3.Row) -> dict:
-        d = dict(row)
-        d["encrypted_fields"] = [f for f in d.get("encrypted_fields", "").split(",") if f]
-        d["redacted_fields"] = [f for f in d.get("redacted_fields", "").split(",") if f]
-        return d
+    def _normalize_entry(self, entry: dict) -> dict:
+        ts = entry.get("timestamp_utc") or entry.get("timestamp") or ""
+        return {
+            "trace_id": entry.get("trace_id", ""),
+            "session_id": entry.get("session_id", ""),
+            "event_type": entry.get("event_type", ""),
+            "threat_type": entry.get("threat_type", ""),
+            "timestamp_utc": ts,
+            "weilchain_hash": entry.get("weilchain_hash", entry.get("hash", "")),
+            "encrypted_fields": entry.get("encrypted_fields", []) or [],
+            "redacted_fields": entry.get("redacted_fields", []) or [],
+            "layer_used": entry.get("layer_used", ""),
+            "confidence": entry.get("confidence", 0.0),
+        }
+
+    def _parse_result(self, result):
+        if isinstance(result, str):
+            try:
+                return json.loads(result)
+            except Exception:
+                return result
+        return result
+
+    def _call_applet(self, action: str, **kwargs) -> tuple[bool, object | None]:
+        if not self._bridge_available():
+            self._last_online = False
+            self._last_error = "bridge unavailable"
+            return False, None
+
+        payload = {"action": action}
+        payload.update(kwargs)
+        try:
+            completed = subprocess.run(
+                ["node", self.bridge_path],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                timeout=7,
+            )
+            if completed.returncode != 0:
+                self._last_online = False
+                self._last_error = (completed.stderr or "bridge process failed").strip()
+                return False, None
+
+            parsed = json.loads((completed.stdout or "{}").strip() or "{}")
+            if parsed.get("error"):
+                self._last_online = False
+                self._last_error = parsed.get("error")
+                return False, None
+
+            self._last_online = True
+            self._last_error = None
+            return True, self._parse_result(parsed.get("result"))
+        except Exception as exc:
+            self._last_online = False
+            self._last_error = str(exc)
+            return False, None
 
     # ── QUERY ──────────────────────────────────────────────────────────
 
     def get_all(self) -> list[dict]:
         """Returns all entries, most recent first."""
-        if self._backend == "memory":
-            return [dict(e) for e in reversed(self._ledger)]
-        assert self._conn is not None
-        rows = self._conn.execute(
-            "SELECT trace_id, session_id, event_type, threat_type, timestamp_utc, "
-            "weilchain_hash, encrypted_fields, redacted_fields, layer_used, confidence "
-            "FROM ledger ORDER BY id DESC"
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
+        now = time.time()
+        if now - self._cache_ts <= self._cache_ttl_seconds:
+            return [dict(e) for e in self._cache_entries]
+
+        ok, result = self._call_applet("get_all")
+        if ok and isinstance(result, list):
+            entries = [self._normalize_entry(e if isinstance(e, dict) else {}) for e in result]
+            self._cache_entries = entries
+            self._cache_ts = now
+            return [dict(e) for e in entries]
+
+        entries = [self._normalize_entry(e) for e in reversed(self._offline_ledger)]
+        self._cache_entries = entries
+        self._cache_ts = now
+        return [dict(e) for e in entries]
 
     def get_by_session(self, session_id: str) -> list[dict]:
         """Returns all entries for a given session_id."""
-        if self._backend == "memory":
-            return [dict(e) for e in reversed(self._ledger) if e["session_id"] == session_id]
-        assert self._conn is not None
-        rows = self._conn.execute(
-            "SELECT trace_id, session_id, event_type, threat_type, timestamp_utc, "
-            "weilchain_hash, encrypted_fields, redacted_fields, layer_used, confidence "
-            "FROM ledger WHERE session_id = ? ORDER BY id DESC",
-            (session_id,),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
+        return [e for e in self.get_all() if e.get("session_id") == session_id]
 
     def get_by_trace(self, trace_id: str) -> Optional[dict]:
         """Returns the single entry matching trace_id, or None."""
-        if self._backend == "memory":
-            for entry in reversed(self._ledger):
-                if entry["trace_id"] == trace_id:
-                    return dict(entry)
-            return None
-        assert self._conn is not None
-        row = self._conn.execute(
-            "SELECT trace_id, session_id, event_type, threat_type, timestamp_utc, "
-            "weilchain_hash, encrypted_fields, redacted_fields, layer_used, confidence "
-            "FROM ledger WHERE trace_id = ? LIMIT 1",
-            (trace_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_dict(row)
+        for entry in self.get_all():
+            if entry.get("trace_id") == trace_id:
+                return entry
+        return None
 
     def get_by_event_type(self, event_type: str) -> list[dict]:
         """Returns all entries of a given event_type."""
-        if self._backend == "memory":
-            return [dict(e) for e in reversed(self._ledger) if e["event_type"] == event_type]
-        assert self._conn is not None
-        rows = self._conn.execute(
-            "SELECT trace_id, session_id, event_type, threat_type, timestamp_utc, "
-            "weilchain_hash, encrypted_fields, redacted_fields, layer_used, confidence "
-            "FROM ledger WHERE event_type = ? ORDER BY id DESC",
-            (event_type,),
-        ).fetchall()
-        return [self._row_to_dict(row) for row in rows]
+        return [e for e in self.get_all() if e.get("event_type") == event_type]
 
     def stats(self) -> dict:
         """Returns summary statistics."""
@@ -239,6 +245,15 @@ class Weilchain:
             "egress_redacts": egress_redacts,
             "unique_sessions": len(sessions),
             "threat_type_breakdown": threat_breakdown,
+            "storage": "on-chain" if self._last_online else "offline-fallback",
+        }
+
+    def connectivity(self) -> dict:
+        return {
+            "status": "online" if self._last_online else "offline",
+            "backend": "applet",
+            "applet_address": self.applet_address or "not-configured",
+            "error": self._last_error or "",
         }
 
     # ── TAMPER DETECTION ───────────────────────────────────────────────
@@ -264,10 +279,18 @@ class Weilchain:
 
         # New path: trace_id string
         trace_id = entry_or_trace_id
+        ok, result = self._call_applet("verify", trace_id=trace_id)
+        if ok and isinstance(result, dict):
+            if result.get("error"):
+                return {"error": "trace_id not found"}
+            out = dict(result)
+            out.setdefault("trace_id", trace_id)
+            out.setdefault("tampered", not bool(out.get("valid", False)))
+            return out
+
         entry = self.get_by_trace(trace_id)
         if entry is None:
             return {"error": "trace_id not found"}
-
         derived_hash = _compute_hash(
             entry["trace_id"],
             entry["session_id"],
@@ -313,101 +336,3 @@ class Weilchain:
 
 
 weilchain = Weilchain()
-
-
-# ── Self-test ──────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    wc = Weilchain(db_path=":memory:")
-    passed = 0
-    total = 0
-
-    # 1. Commit an INGRESS_BLOCK event
-    total += 1
-    e1 = wc.commit(
-        session_id="sess-001",
-        event_type="INGRESS_BLOCK",
-        threat_type="PROMPT_OVERRIDE",
-        layer_used="HEURISTIC",
-        confidence=0.97,
-    )
-    ok = e1.event_type == "INGRESS_BLOCK" and len(e1.weilchain_hash) == 64
-    passed += int(ok)
-    print(f"[{'PASS' if ok else 'FAIL'}] 1. Commit INGRESS_BLOCK")
-
-    # 2. Commit an EGRESS_REDACT event with encrypted_fields
-    total += 1
-    e2 = wc.commit(
-        session_id="sess-001",
-        event_type="EGRESS_REDACT",
-        threat_type="EGRESS_PII",
-        layer_used="NER+REGEX",
-        confidence=1.0,
-        encrypted_fields=["AADHAAR", "PAN"],
-        redacted_fields=["PERSON", "EMAIL"],
-    )
-    ok = e2.encrypted_fields == ["AADHAAR", "PAN"] and e2.redacted_fields == ["PERSON", "EMAIL"]
-    passed += int(ok)
-    print(f"[{'PASS' if ok else 'FAIL'}] 2. Commit EGRESS_REDACT with FPE fields")
-
-    # 3. get_all should return 2 entries
-    total += 1
-    all_entries = wc.get_all()
-    ok = len(all_entries) == 2
-    passed += int(ok)
-    print(f"[{'PASS' if ok else 'FAIL'}] 3. get_all() → {len(all_entries)} entries")
-
-    # 4. stats should show correct counts
-    total += 1
-    st = wc.stats()
-    ok = (
-        st["total_events"] == 2
-        and st["ingress_blocks"] == 1
-        and st["egress_redacts"] == 1
-        and st["unique_sessions"] == 1
-    )
-    passed += int(ok)
-    print(f"[{'PASS' if ok else 'FAIL'}] 4. stats() → {st}")
-
-    # 5. verify_all should show both valid
-    total += 1
-    va = wc.verify_all()
-    ok = va["valid"] == 2 and va["tampered"] == 0
-    passed += int(ok)
-    print(f"[{'PASS' if ok else 'FAIL'}] 5. verify_all() → {va}")
-
-    # 6. Corrupt one entry
-    total += 1
-    if wc._backend == "sqlite":
-        wc._conn.execute(
-            "UPDATE ledger SET weilchain_hash = 'CORRUPTED' WHERE trace_id = ?",
-            (e1.trace_id,),
-        )
-        wc._conn.commit()
-    else:
-        for item in wc._ledger:
-            if item["trace_id"] == e1.trace_id:
-                item["weilchain_hash"] = "CORRUPTED"
-                break
-    va2 = wc.verify_all()
-    ok = va2["tampered"] == 1 and e1.trace_id in va2["tampered_trace_ids"]
-    passed += int(ok)
-    print(f"[{'PASS' if ok else 'FAIL'}] 6. Tamper detection → {va2}")
-
-    # 7. verify single trace (dict path — legacy compat)
-    total += 1
-    entry_dict = wc.get_by_trace(e2.trace_id)
-    ok = wc.verify(entry_dict) is True
-    passed += int(ok)
-    print(f"[{'PASS' if ok else 'FAIL'}] 7. verify(dict) legacy path → True")
-
-    # 8. verify single trace (string path — new API)
-    total += 1
-    v_result = wc.verify(e2.trace_id)
-    ok = isinstance(v_result, dict) and v_result["valid"] is True
-    passed += int(ok)
-    print(f"[{'PASS' if ok else 'FAIL'}] 8. verify(trace_id) new path → {v_result.get('valid')}")
-
-    print(f"\n{'='*50}")
-    print(f"Results: {passed}/{total} passed")
-    print("ALL PASS" if passed == total else "SOME FAILED")

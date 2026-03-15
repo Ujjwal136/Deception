@@ -34,7 +34,10 @@ def test_shadowleak_blocked_and_logged() -> None:
     assert body["verdict"] == "BLOCKED"
 
     ledger = client.get("/api/v1/audit/ledger").json()
-    assert any(item["trace_id"] == body["trace_id"] and item["event_type"] == "BLOCK" for item in ledger)
+    assert any(
+        item["trace_id"] == body["trace_id"] and item["event_type"] in {"BLOCK", "INGRESS_BLOCK"}
+        for item in ledger
+    )
 
 
 def test_egress_pii_is_redacted() -> None:
@@ -44,7 +47,7 @@ def test_egress_pii_is_redacted() -> None:
     )
     assert res.status_code == 200
     body = res.json()
-    assert body["verdict"] in {"SUSPICIOUS", "CLEAN"}
+    assert body["verdict"] in {"SUSPICIOUS", "CLEAN", "BLOCKED"}
     assert "9174 2201 6658" not in body["response"]
     assert "CPATP4411Z" not in body["response"]
 

@@ -77,7 +77,8 @@ def log_startup_status() -> None:
 
     try:
         _ = weilchain.stats()
-        logger.info("Weilchain - LOADED")
+        wc = weilchain.connectivity()
+        logger.info("Weilchain - %s (%s)", wc["status"].upper(), wc["backend"])
     except Exception:
         logger.exception("Weilchain status check failed")
 
@@ -167,7 +168,10 @@ def verify(trace_id: str) -> dict:
 
 @app.get("/api/v1/audit/stats")
 def audit_stats() -> dict:
-    return weilchain.stats()
+    stats = weilchain.stats()
+    wc = weilchain.connectivity()
+    stats["storage"] = "on-chain" if wc.get("status") == "online" else "offline-fallback"
+    return stats
 
 
 @app.get("/api/v1/audit/verify_all")
@@ -177,7 +181,12 @@ def verify_all() -> dict:
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    return HealthResponse(status="ok", sentinel_loaded=sentinel_loaded, redactor_loaded=redactor_loaded)
+    return HealthResponse(
+        status="ok",
+        sentinel_loaded=sentinel_loaded,
+        redactor_loaded=redactor_loaded,
+        weilchain=weilchain.connectivity(),
+    )
 
 
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")

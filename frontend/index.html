@@ -579,6 +579,7 @@
     <div class="header-status">
       <div class="status-dot" id="healthDot"></div>
       <span id="healthLabel">Firewall Active</span>
+      <span id="weilchainBadge" class="dot-offline" style="margin-left:8px;">Offline</span>
     </div>
   </header>
 
@@ -698,8 +699,10 @@
           </div>
           <div class="status-card">
             <div class="status-card-header"><span>🔗</span> Weilchain</div>
+            <div class="status-row"><span class="sk">Status</span><span class="sv" id="syWcStatus">—</span></div>
+            <div class="status-row"><span class="sk">Backend</span><span class="sv" id="syWcBackend">Applet</span></div>
+            <div class="status-row"><span class="sk">Applet</span><span class="sv" id="syWcAddress">—</span></div>
             <div class="status-row"><span class="sk">Entries</span><span class="sv" id="syWcEntries">—</span></div>
-            <div class="status-row"><span class="sk">Sessions</span><span class="sv" id="syWcSessions">—</span></div>
             <div class="status-row"><span class="sk">Tampered</span><span class="sv" id="syWcTampered">—</span></div>
           </div>
           <div class="status-card">
@@ -1039,12 +1042,23 @@
           $healthDot.className = "status-dot";
           $healthLabel.textContent = "Firewall Active";
 
+          var wc = h.weilchain || {};
+          var onChain = wc.status === "online";
+          var $wcBadge = document.getElementById("weilchainBadge");
+          $wcBadge.className = onChain ? "dot-ready" : "dot-offline";
+          $wcBadge.textContent = onChain ? "On-Chain" : "Offline";
+
           document.getElementById("sySentA").innerHTML = h.sentinel_loaded
             ? '<span class="dot-ready">Ready</span>'
             : '<span class="dot-offline">Offline</span>';
           document.getElementById("syRedNer").innerHTML = h.redactor_loaded
             ? '<span class="dot-ready">Ready</span>'
             : '<span class="dot-offline">Offline</span>';
+          document.getElementById("syWcStatus").innerHTML = onChain
+            ? '<span class="dot-ready">On-Chain</span>'
+            : '<span class="dot-offline">Offline</span>';
+          document.getElementById("syWcBackend").textContent = wc.backend || "Applet";
+          document.getElementById("syWcAddress").textContent = wc.applet_address || "not-configured";
           document.getElementById("syLlmProv").textContent = "Mock";
           document.getElementById("lastCheck").textContent = "Last check: " + new Date().toLocaleTimeString();
 
@@ -1054,7 +1068,6 @@
             if (sr.ok) {
               var st = await sr.json();
               document.getElementById("syWcEntries").textContent = st.total_events || 0;
-              document.getElementById("syWcSessions").textContent = st.unique_sessions || 0;
               document.getElementById("syWcTampered").textContent = "0";
             }
           } catch (_) { /* ignore */ }
@@ -1070,8 +1083,12 @@
         } catch (_) {
           $healthDot.className = "status-dot offline";
           $healthLabel.textContent = "Firewall Offline";
+          var $wcBadgeOff = document.getElementById("weilchainBadge");
+          $wcBadgeOff.className = "dot-offline";
+          $wcBadgeOff.textContent = "Offline";
           document.getElementById("sySentA").innerHTML = '<span class="dot-offline">Offline</span>';
           document.getElementById("syRedNer").innerHTML = '<span class="dot-offline">Offline</span>';
+          document.getElementById("syWcStatus").innerHTML = '<span class="dot-offline">Offline</span>';
           document.getElementById("lastCheck").textContent = "Last check: " + new Date().toLocaleTimeString() + " (offline)";
         }
       }

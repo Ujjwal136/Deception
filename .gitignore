@@ -8,3 +8,5 @@ __pycache__/
 firewall/aegis_redactor/
 firewall/aegis_layer_b/
 sentinel_b_model.joblib
+applet/node_modules/
+applet/build/

@@ -1,0 +1,18 @@
+{
+  "name": "aegis-audit-applet",
+  "version": "1.0.0",
+  "description": "Weilliptic Applet for Aegis on-chain audit trail",
+  "scripts": {
+    "asbuild": "asc assembly/index.ts --outFile build/aegis_audit.wasm --optimize",
+    "bridge": "node bridge.js"
+  },
+  "devDependencies": {
+    "assemblyscript": "latest"
+  },
+  "dependencies": {
+    "@weilliptic/weil-sdk": "latest",
+    "assemblyscript-crypto": "latest",
+    "assemblyscript-json": "latest",
+    "json-as": "latest"
+  }
+}
