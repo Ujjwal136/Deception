@@ -1,6 +1,7 @@
 import os
 import logging
 from dataclasses import dataclass
+from collections import OrderedDict
 
 from openai import OpenAI
 
@@ -48,6 +49,8 @@ class LLMAgent:
 
     def __init__(self):
         self._model_name = settings.llm_model
+        self._general_cache: OrderedDict[str, str] = OrderedDict()
+        self._general_cache_max = int(os.getenv("GENERAL_CACHE_SIZE", "128"))
 
     def _resolve_provider(self) -> str:
         if os.getenv("TEST_MODE", "").lower() == "true" or os.getenv("PYTEST_CURRENT_TEST"):
@@ -77,10 +80,11 @@ class LLMAgent:
             return self._call_mock(user_message)
 
         try:
-            client = OpenAI(api_key=api_key)
+            client = OpenAI(api_key=api_key, max_retries=0, timeout=8)
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 temperature=0.1,
+                max_tokens=220,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_message},
@@ -171,14 +175,96 @@ class LLMAgent:
             )
         return "I can help with Aegis Bank account queries, transfers, and general banking process questions."
 
+    def _quick_local_general_answer(self, user_message: str) -> str | None:
+        lowered = user_message.lower().strip()
+
+        if lowered in ("hi", "hello", "hey", "hello aegis", "hi aegis"):
+            return "Hello. I can help with balances, customer lookups, transfers, and banking policy questions."
+
+        if "what can you help" in lowered:
+            return "I can help with account balances, customer details, transfer guidance, and general banking process and fee questions."
+
+        if "upi" in lowered and "pin" in lowered and "reset" in lowered:
+            return (
+                "To reset your UPI PIN, open your UPI or bank app, choose your linked account, tap Reset UPI PIN, "
+                "verify with card details and OTP, then set a new PIN."
+            )
+
+        if "neft" in lowered and ("charge" in lowered or "fee" in lowered):
+            return (
+                "NEFT is usually free on most net/mobile banking channels, while branch requests may include a small service fee plus GST."
+            )
+
+        return None
+
+    def _cache_get(self, key: str) -> str | None:
+        if key not in self._general_cache:
+            return None
+        value = self._general_cache.pop(key)
+        self._general_cache[key] = value
+        return value
+
+    def _cache_put(self, key: str, value: str) -> None:
+        if key in self._general_cache:
+            self._general_cache.pop(key)
+        self._general_cache[key] = value
+        while len(self._general_cache) > self._general_cache_max:
+            self._general_cache.popitem(last=False)
+
+    def _fast_synthesize_from_data(self, user_prompt: str, sanitised_data: list[dict]) -> str:
+        rows = sanitised_data[:3]
+        lowered = user_prompt.lower()
+        lines: list[str] = []
+
+        if "balance" in lowered and rows:
+            row = rows[0]
+            name = row.get("full_name", "Customer")
+            balance = row.get("balance", "N/A")
+            account_type = row.get("account_type", "")
+            city = row.get("city", "")
+            return (
+                f"{name} has a current {account_type} account balance of {balance}."
+                + (f" Registered city: {city}." if city else "")
+            )
+
+        for idx, row in enumerate(rows, 1):
+            name = row.get("full_name", f"Customer {idx}")
+            customer_id = row.get("customer_id", "")
+            account_type = row.get("account_type", "")
+            balance = row.get("balance", "")
+            city = row.get("city", "")
+            parts = [p for p in [customer_id, name, account_type, str(balance) if balance != "" else "", city] if p]
+            lines.append(f"{idx}. " + " | ".join(parts))
+
+        if not lines:
+            return "I could not find relevant account details for this request."
+
+        suffix = "" if len(sanitised_data) <= 3 else f" Showing first {len(rows)} of {len(sanitised_data)} records."
+        return "Here are the matched customer records:\n" + "\n".join(lines) + suffix
+
     def ask(self, user_prompt: str, session_id: str) -> str:
         """Send a general question to the LLM (no DB context)."""
+        normalized = " ".join(user_prompt.lower().split())
+
+        quick = self._quick_local_general_answer(user_prompt)
+        if quick:
+            return quick
+
+        cached = self._cache_get(normalized)
+        if cached:
+            return cached
+
         try:
             result = self._call_llm(GENERAL_BANKING_PROMPT, user_prompt)
-            return result["text"]
+            text = result["text"]
+            if text:
+                self._cache_put(normalized, text)
+            return text
         except Exception:
             logger.exception("LLM ask() call failed")
-            return self._fallback_general_answer(user_prompt)
+            fallback = self._fallback_general_answer(user_prompt)
+            self._cache_put(normalized, fallback)
+            return fallback
 
     def synthesize(
         self,
@@ -195,6 +281,16 @@ class LLMAgent:
                 trace_id=trace_id,
                 was_blocked=False,
                 model_used=self._resolve_provider(),
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if os.getenv("FAST_SYNTHESIS", "true").lower() == "true":
+            return AgentResponse(
+                answer=self._fast_synthesize_from_data(user_prompt, sanitised_data),
+                trace_id=trace_id,
+                was_blocked=False,
+                model_used="fast-template",
                 input_tokens=0,
                 output_tokens=0,
             )

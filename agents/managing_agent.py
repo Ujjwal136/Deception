@@ -51,6 +51,32 @@ Database schema:
             "sneha sharma", "kiran reddy", "meera pillai", "rohit gupta", "ananya bose",
         }
 
+    def _plan_fast_sql(self, user_intent: str) -> str | None:
+        lowered = user_intent.lower()
+
+        cust_match = re.search(r"\bcust\s*0*([1-9]|10)\b", lowered)
+        if cust_match:
+            cust_id = f"CUST{int(cust_match.group(1)):03d}"
+            if "balance" in lowered:
+                return (
+                    "SELECT customer_id, full_name, account_type, balance, city "
+                    f"FROM customers WHERE customer_id = '{cust_id}'"
+                )
+            return (
+                "SELECT customer_id, full_name, aadhaar, pan, account_no, ifsc, phone, account_type, balance, city, kyc_status "
+                f"FROM customers WHERE customer_id = '{cust_id}'"
+            )
+
+        for city in ("mumbai", "chennai", "delhi", "bangalore", "hyderabad", "kolkata", "jaipur", "kochi", "lucknow", "ahmedabad"):
+            if city in lowered and ("customer" in lowered or "show" in lowered or "list" in lowered):
+                pretty_city = city.capitalize()
+                return (
+                    "SELECT customer_id, full_name, city, account_type, balance "
+                    f"FROM customers WHERE city = '{pretty_city}' LIMIT 10"
+                )
+
+        return None
+
     def _call_llm(self, user_intent: str) -> str:
         system = self.SYSTEM_PROMPT.format(schema=self._schema)
         provider = self._resolve_provider()
@@ -81,10 +107,12 @@ Database schema:
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 temperature=0.1,
+                max_tokens=180,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_intent},
                 ],
+                timeout=8,
             )
             return response.choices[0].message.content or ""
         except Exception:
@@ -210,22 +238,25 @@ Database schema:
                 success=True,
             )
 
-        # Step 1: Get SQL from LLM
-        try:
-            llm_response = self._extract_json_content(self._call_llm(user_intent))
-        except Exception as e:
-            logger.exception("LLM call failed for intent=%r", user_intent)
-            return QueryResult(sql_executed="", raw_data=[], row_count=0,
-                               success=False, error="LLM returned invalid query format")
+        # Step 1: Try deterministic low-latency planning for common intents.
+        sql = self._plan_fast_sql(user_intent)
 
-        # Step 2: Parse JSON response
-        try:
-            parsed = json.loads(llm_response)
-            sql = parsed["sql"]
-        except (json.JSONDecodeError, KeyError, TypeError):
-            logger.error("Invalid LLM planning payload: %r", llm_response)
-            return QueryResult(sql_executed="", raw_data=[], row_count=0,
-                               success=False, error="LLM returned invalid query format")
+        # Step 2: Fall back to LLM planning only when needed.
+        if not sql:
+            try:
+                llm_response = self._extract_json_content(self._call_llm(user_intent))
+            except Exception:
+                logger.exception("LLM call failed for intent=%r", user_intent)
+                return QueryResult(sql_executed="", raw_data=[], row_count=0,
+                                   success=False, error="LLM returned invalid query format")
+
+            try:
+                parsed = json.loads(llm_response)
+                sql = parsed["sql"]
+            except (json.JSONDecodeError, KeyError, TypeError):
+                logger.error("Invalid LLM planning payload: %r", llm_response)
+                return QueryResult(sql_executed="", raw_data=[], row_count=0,
+                                   success=False, error="LLM returned invalid query format")
 
         logger.info("SQL generated: %s", sql)
 

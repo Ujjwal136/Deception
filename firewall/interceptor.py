@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import logging
+import os
+import threading
 from uuid import uuid4
 
 from firewall.redactor import Redactor
 from firewall.sentinel import Sentinel
 from firewall.weilchain import Weilchain
+
+logger = logging.getLogger("aegis")
 
 
 class Interceptor:
@@ -12,12 +17,28 @@ class Interceptor:
         self.sentinel = sentinel
         self.redactor = redactor
         self.weilchain = weilchain
+        is_test_mode = os.getenv("TEST_MODE", "").lower() == "true" or bool(os.getenv("PYTEST_CURRENT_TEST"))
+        self._async_commit = (os.getenv("WEILCHAIN_ASYNC_COMMIT", "true").lower() == "true") and (not is_test_mode)
+
+    def _commit_event(self, **kwargs) -> None:
+        is_test_mode = os.getenv("TEST_MODE", "").lower() == "true" or bool(os.getenv("PYTEST_CURRENT_TEST"))
+        if (not self._async_commit) or is_test_mode:
+            self.weilchain.commit(**kwargs)
+            return
+
+        def _runner() -> None:
+            try:
+                self.weilchain.commit(**kwargs)
+            except Exception:
+                logger.exception("Async Weilchain commit failed")
+
+        threading.Thread(target=_runner, name="weilchain-commit", daemon=True).start()
 
     def ingress(self, prompt: str, session_id: str) -> dict:
         trace_id = str(uuid4())
         scan = self.sentinel.scan(prompt)
         if scan["is_threat"]:
-            self.weilchain.commit(
+            self._commit_event(
                 session_id=session_id,
                 event_type="INGRESS_BLOCK",
                 threat_type=scan["threat_type"],
@@ -48,7 +69,7 @@ class Interceptor:
         result = self.redactor.redact(payload)
         verdict = "SUSPICIOUS" if result["redactions"] else "CLEAN"
         if verdict == "SUSPICIOUS":
-            self.weilchain.commit(
+            self._commit_event(
                 session_id=session_id,
                 event_type="EGRESS_REDACT",
                 threat_type="EGRESS_PII",
