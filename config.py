@@ -8,12 +8,12 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
 
-    llm_provider: str = "mock"
-    llm_model: str = "gpt-4o-mini"
-    openai_api_key: str = ""
-    anthropic_api_key: str = ""
-    fpe_key: str = ""
-    fpe_tweak: str = ""
+    LLM_PROVIDER: str = "openai"
+    LLM_MODEL: str = "gpt-4o-mini"
+    OPENAI_API_KEY: str = ""
+    ANTHROPIC_API_KEY: str = ""
+    FPE_KEY: str = ""
+    FPE_TWEAK: str = ""
 
     sentinel_model_path: str = "sentinel_model.joblib"
     sentinel_b_model_path: str = "sentinel_b_model.joblib"
@@ -23,8 +23,31 @@ class Settings(BaseSettings):
     ner_model_path: str = "redactor_ner_model.joblib"
 
     database_path: str = "banking.db"
-    weilchain_db_path: str = "weilchain.db"
     weil_key_path: str = "private_key.wc"
+
+    @property
+    def llm_provider(self) -> str:
+        return self.LLM_PROVIDER
+
+    @property
+    def llm_model(self) -> str:
+        return self.LLM_MODEL
+
+    @property
+    def openai_api_key(self) -> str:
+        return self.OPENAI_API_KEY
+
+    @property
+    def anthropic_api_key(self) -> str:
+        return self.ANTHROPIC_API_KEY
+
+    @property
+    def fpe_key(self) -> str:
+        return self.FPE_KEY
+
+    @property
+    def fpe_tweak(self) -> str:
+        return self.FPE_TWEAK
 
 
 settings = Settings()

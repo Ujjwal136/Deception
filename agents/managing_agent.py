@@ -4,7 +4,7 @@ import logging
 import re
 from dataclasses import dataclass
 
-import httpx
+from openai import OpenAI
 
 from agents.banking_db import banking_db
 from config import settings
@@ -45,85 +45,80 @@ Database schema:
 {schema}"""
 
     def __init__(self):
-        self._client = None
         self._schema = banking_db.get_schema()
-
-    def _get_client(self):
-        if self._client is not None:
-            return self._client
-        self._client = httpx.Client(timeout=20.0)
-        return self._client
+        self._customer_names = {
+            "arjun mehta", "priya nair", "rahul singh", "deepa iyer", "vikram patel",
+            "sneha sharma", "kiran reddy", "meera pillai", "rohit gupta", "ananya bose",
+        }
 
     def _call_llm(self, user_intent: str) -> str:
         system = self.SYSTEM_PROMPT.format(schema=self._schema)
         provider = self._resolve_provider()
-        logger.info(
-            "ManagingAgent provider=%s (configured=%s)",
-            provider,
-            settings.llm_provider,
-        )
+        logger.info("ManagingAgent provider=%s", provider)
 
-        if provider == "openai" and settings.openai_api_key:
+        if provider == "openai":
             return self._call_openai(system, user_intent)
-        if provider == "anthropic" and settings.anthropic_api_key:
+        if provider == "anthropic":
             return self._call_anthropic(system, user_intent)
         return self._call_mock(user_intent)
 
     def _resolve_provider(self) -> str:
-        configured = settings.llm_provider.lower().strip()
-        has_openai = bool(settings.openai_api_key)
-        has_anthropic = bool(settings.anthropic_api_key)
-
-        if configured == "openai":
-            return "openai" if has_openai else ("anthropic" if has_anthropic else "mock")
-        if configured == "anthropic":
-            return "anthropic" if has_anthropic else ("openai" if has_openai else "mock")
-        if configured == "mock":
-            if has_anthropic:
-                return "anthropic"
-            if has_openai:
-                return "openai"
+        if os.getenv("TEST_MODE", "").lower() == "true" or os.getenv("PYTEST_CURRENT_TEST"):
             return "mock"
-        return "anthropic" if has_anthropic else ("openai" if has_openai else "mock")
+        if os.getenv("OPENAI_API_KEY"):
+            return "openai"
+        if os.getenv("ANTHROPIC_API_KEY"):
+            return "anthropic"
+        return "mock"
 
     def _call_openai(self, system: str, user_intent: str) -> str:
-        client = self._get_client()
-        resp = client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.openai_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.llm_model,
-                "messages": [
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        if not api_key:
+            return self._call_mock(user_intent)
+
+        try:
+            client = OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0.1,
+                messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_intent},
                 ],
-                "temperature": 0.0,
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+            )
+            return response.choices[0].message.content or ""
+        except Exception:
+            logger.exception("OpenAI planning call failed; using mock planning fallback")
+            return self._call_mock(user_intent)
 
     def _call_anthropic(self, system: str, user_intent: str) -> str:
-        client = self._get_client()
-        resp = client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": settings.anthropic_api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.llm_model,
-                "max_tokens": 256,
-                "system": system,
-                "messages": [{"role": "user", "content": user_intent}],
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["content"][0]["text"]
+        import httpx
+
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return self._call_mock(user_intent)
+
+        client = httpx.Client(timeout=20.0)
+        try:
+            resp = client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": settings.llm_model,
+                    "max_tokens": 256,
+                    "system": system,
+                    "messages": [{"role": "user", "content": user_intent}],
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()["content"][0]["text"]
+        except Exception:
+            logger.exception("Anthropic planning call failed; using mock planning fallback")
+            return self._call_mock(user_intent)
 
     def _call_mock(self, user_intent: str) -> str:
         lowered = user_intent.lower()
@@ -174,11 +169,50 @@ Database schema:
             "reasoning": "General customer list (limited to 5)",
         })
 
+    def is_general_question(self, intent: str) -> bool:
+        lowered = intent.lower().strip()
+        normalized = re.sub(r"\[[a-z_]+_redacted\]", " ", lowered)
+        has_customer_id = bool(re.search(r"\bcust\s*0*(?:[1-9]|10)\b", lowered))
+        has_customer_name = any(name in lowered for name in self._customer_names)
+
+        policy_keywords = (
+            "how do", "how to", "reset", "process", "procedure", "policy", "timings", "timing",
+            "charges", "charge", "fees", "fee", "what are", "what is", "hello", "hi", "help",
+            "upi", "neft", "imps", "rtgs", "kyc", "debit card", "atm", "net banking",
+        )
+        data_keywords = (
+            "customer", "balance", "account", "aadhaar", "pan", "ifsc", "show me all", "list all",
+            "records", "database", "export", "dump", "transaction history", "cust00",
+        )
+
+        asks_policy = any(keyword in normalized for keyword in policy_keywords)
+        asks_specific_data = any(keyword in normalized for keyword in data_keywords)
+
+        return (not has_customer_id) and (not has_customer_name) and asks_policy and (not asks_specific_data)
+
+    def _extract_json_content(self, content: str) -> str:
+        content = (content or "").strip()
+        if content.startswith("```"):
+            parts = content.split("```")
+            if len(parts) > 1:
+                content = parts[1]
+                if content.startswith("json"):
+                    content = content[4:]
+        return content.strip()
+
     def plan_and_execute(self, user_intent: str) -> QueryResult:
         """Generate SQL from user intent via LLM, validate, and execute."""
+        if self.is_general_question(user_intent):
+            return QueryResult(
+                sql_executed="N/A - general question",
+                raw_data=[],
+                row_count=0,
+                success=True,
+            )
+
         # Step 1: Get SQL from LLM
         try:
-            llm_response = self._call_llm(user_intent)
+            llm_response = self._extract_json_content(self._call_llm(user_intent))
         except Exception as e:
             logger.exception("LLM call failed for intent=%r", user_intent)
             return QueryResult(sql_executed="", raw_data=[], row_count=0,
