@@ -36,7 +36,7 @@ logger = logging.getLogger("aegis")
 
 sentinel = Sentinel()
 redactor = Redactor()
-weilchain = Weilchain(db_path=settings.weilchain_db_path)
+weilchain = Weilchain()
 interceptor = Interceptor(sentinel, redactor, weilchain)
 
 sentinel_loaded = sentinel.load()
@@ -77,6 +77,7 @@ def log_startup_status() -> None:
 
     try:
         _ = weilchain.stats()
+        weilchain.start_background_receipt_polling()
         wc = weilchain.connectivity()
         logger.info("Weilchain - %s (%s)", wc["status"].upper(), wc["backend"])
     except Exception:
@@ -89,6 +90,14 @@ def log_startup_status() -> None:
         logger.exception("Banking DB status check failed")
 
     logger.info("Aegis Firewall ready")
+
+
+@app.on_event("shutdown")
+def stop_background_jobs() -> None:
+    try:
+        weilchain.stop_background_receipt_polling()
+    except Exception:
+        logger.exception("Failed to stop Weilchain background poller")
 
 
 @app.post("/api/v1/chat", response_model=ChatResponse)

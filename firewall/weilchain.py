@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -83,16 +85,22 @@ class WeilEntry:
     block_height: str = ""
     batch_id: str = ""
     tx_idx: str = ""
+    tx_hash: str = ""
+    receipt_status: str = ""
     onchain: bool = False
 
 
 class Weilchain:
-    def __init__(self, db_path: str = "weilchain.db") -> None:
-        _ = db_path  # legacy arg retained for compatibility
+    def __init__(self) -> None:
         self._backend = "weilchain_applet"
         self._cache: list[dict] = []
+        self._cache_lock = threading.RLock()
         self._cache_time: float = 0.0
         self._cache_ttl_seconds = 10.0
+        self._pending_receipt_traces: set[str] = set()
+        self._poll_stop_event = threading.Event()
+        self._polling_thread: threading.Thread | None = None
+        self._poll_interval_seconds = 2.0
         self._wallet: Wallet | None = None
         self._sdk_ready = False
         self._last_error: str = ""
@@ -124,14 +132,202 @@ class Weilchain:
 
         async with WeilClient(self._wallet) as client:
             result = await client.audit(message)
+            tx_hash = self._extract_tx_hash(result)
             return {
                 "status": getattr(result, "status", ""),
                 "block_height": getattr(result, "block_height", ""),
                 "batch_id": getattr(result, "batch_id", ""),
                 "tx_idx": getattr(result, "tx_idx", ""),
+                "tx_hash": tx_hash,
+                "receipt_status": self._normalize_receipt_status(getattr(result, "status", "")),
                 "txn_result": getattr(result, "txn_result", ""),
                 "creation_time": str(getattr(result, "creation_time", "")),
             }
+
+    def start_background_receipt_polling(self, interval_seconds: float = 2.0) -> None:
+        if self._polling_thread and self._polling_thread.is_alive():
+            return
+
+        self._poll_interval_seconds = max(1.0, float(interval_seconds))
+        self._poll_stop_event.clear()
+        self._polling_thread = threading.Thread(
+            target=self._run_receipt_poll_loop,
+            name="weilchain-receipt-poller",
+            daemon=True,
+        )
+        self._polling_thread.start()
+        logger.info("WeilChain receipt poller started (interval=%ss)", self._poll_interval_seconds)
+
+    def stop_background_receipt_polling(self) -> None:
+        self._poll_stop_event.set()
+        thread = self._polling_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=3.0)
+        self._polling_thread = None
+
+    def _run_receipt_poll_loop(self) -> None:
+        try:
+            asyncio.run(self._receipt_poll_loop())
+        except Exception as exc:
+            logger.warning("WeilChain receipt poller stopped: %s", exc)
+
+    async def _receipt_poll_loop(self) -> None:
+        while not self._poll_stop_event.is_set():
+            await self._poll_pending_receipts_once()
+            await asyncio.sleep(self._poll_interval_seconds)
+
+    async def _poll_pending_receipts_once(self) -> None:
+        if not self._sdk_ready or not self._wallet:
+            return
+
+        with self._cache_lock:
+            pending = list(self._pending_receipt_traces)
+
+        for trace_id in pending:
+            with self._cache_lock:
+                entry = next((e for e in self._cache if e.get("trace_id") == trace_id), None)
+
+            if entry is None:
+                with self._cache_lock:
+                    self._pending_receipt_traces.discard(trace_id)
+                continue
+
+            if entry.get("tx_hash") and not self._is_in_progress(entry.get("receipt_status", "")):
+                with self._cache_lock:
+                    self._pending_receipt_traces.discard(trace_id)
+                continue
+
+            update = await self._fetch_receipt_update(entry)
+            if not update:
+                continue
+
+            with self._cache_lock:
+                current = next((e for e in self._cache if e.get("trace_id") == trace_id), None)
+                if current is None:
+                    self._pending_receipt_traces.discard(trace_id)
+                    continue
+
+                if update.get("tx_hash"):
+                    current["tx_hash"] = str(update["tx_hash"])
+                if update.get("receipt_status"):
+                    current["receipt_status"] = self._normalize_receipt_status(update["receipt_status"])
+                if update.get("block_height") is not None:
+                    current["block_height"] = str(update.get("block_height", current.get("block_height", "")))
+
+                if current.get("tx_hash") and not self._is_in_progress(current.get("receipt_status", "")):
+                    self._pending_receipt_traces.discard(trace_id)
+
+    async def _fetch_receipt_update(self, entry: dict) -> dict:
+        trace_id = str(entry.get("trace_id", "") or "").strip()
+        batch_id = str(entry.get("batch_id", "") or "").strip()
+        tx_idx_raw = str(entry.get("tx_idx", "") or "").strip()
+        endpoint_specs: list[tuple[str, str, dict | None]] = []
+
+        if batch_id and tx_idx_raw != "":
+            try:
+                tx_idx = int(tx_idx_raw)
+                payload = {"batch_id": batch_id, "tx_idx": tx_idx}
+                endpoint_specs.extend([
+                    ("POST", "/contracts/get_transaction_result", payload),
+                    ("POST", "/contracts/get_transaction_status", payload),
+                    ("GET", f"/contracts/transaction/{batch_id}/{tx_idx}", None),
+                    ("GET", f"/contracts/tx/{batch_id}/{tx_idx}", None),
+                ])
+            except ValueError:
+                pass
+
+        if trace_id:
+            payload_trace = {"trace_id": trace_id}
+            endpoint_specs.extend([
+                ("POST", "/contracts/get_transaction_result_by_trace", payload_trace),
+                ("POST", "/contracts/get_transaction_by_trace", payload_trace),
+                ("POST", "/contracts/get_receipt_by_trace", payload_trace),
+            ])
+
+        if not endpoint_specs:
+            return {}
+
+        try:
+            async with WeilClient(self._wallet) as client:
+                for method, path, body in endpoint_specs:
+                    try:
+                        if method == "POST":
+                            resp = await client._http_client.post(path, json=body)
+                        else:
+                            resp = await client._http_client.get(path)
+
+                        if resp.status_code >= 400:
+                            continue
+
+                        data = resp.json()
+                        parsed = self._parse_receipt_response(data)
+                        if parsed:
+                            return parsed
+                    except Exception:
+                        continue
+        except Exception:
+            return {}
+
+        return {}
+
+    def _parse_receipt_response(self, payload: object) -> dict:
+        data = payload
+        if isinstance(data, dict) and "Ok" in data and isinstance(data["Ok"], dict):
+            data = data["Ok"]
+
+        if not isinstance(data, dict):
+            return {}
+
+        status = data.get("status") or data.get("receipt_status") or ""
+        tx_hash = data.get("tx_hash") or data.get("transaction_hash") or data.get("hash") or ""
+        block_height = data.get("block_height")
+
+        return {
+            "receipt_status": self._normalize_receipt_status(status),
+            "tx_hash": str(tx_hash) if tx_hash else "",
+            "block_height": block_height,
+        }
+
+    def _normalize_receipt_status(self, status: object) -> str:
+        raw = str(status or "").strip()
+        upper = raw.upper()
+        if "IN_PROGRESS" in upper or upper.endswith("INPROGRESS"):
+            return "IN_PROGRESS"
+        if "FINAL" in upper:
+            return "FINALIZED"
+        if "CONFIRM" in upper:
+            return "CONFIRMED"
+        if "FAIL" in upper:
+            return "FAILED"
+        return raw
+
+    def _is_in_progress(self, status: object) -> bool:
+        return self._normalize_receipt_status(status) == "IN_PROGRESS"
+
+    def _extract_tx_hash(self, result: object) -> str:
+        # Prefer direct attributes if the SDK exposes a transaction hash.
+        for attr in ("tx_hash", "transaction_hash", "hash"):
+            value = getattr(result, attr, "")
+            if value:
+                return str(value)
+
+        # Fallback: parse txn_result payload for hash fields.
+        txn_result = getattr(result, "txn_result", "")
+        if isinstance(txn_result, dict):
+            for key in ("tx_hash", "transaction_hash", "hash"):
+                if txn_result.get(key):
+                    return str(txn_result.get(key))
+        elif isinstance(txn_result, str) and txn_result.strip():
+            try:
+                parsed = json.loads(txn_result)
+                if isinstance(parsed, dict):
+                    for key in ("tx_hash", "transaction_hash", "hash"):
+                        if parsed.get(key):
+                            return str(parsed.get(key))
+            except json.JSONDecodeError:
+                pass
+
+        return ""
 
     def commit(
         self,
@@ -179,10 +375,15 @@ class Weilchain:
                 entry.block_height = str(onchain_result.get("block_height", ""))
                 entry.batch_id = str(onchain_result.get("batch_id", ""))
                 entry.tx_idx = str(onchain_result.get("tx_idx", ""))
+                entry.tx_hash = str(onchain_result.get("tx_hash", ""))
+                entry.receipt_status = str(onchain_result.get("receipt_status", ""))
                 entry.onchain = True
                 # Keep an in-process mirror so /api/v1/audit/ledger can show
                 # recent on-chain commits without a chain query endpoint.
-                self._cache.append(asdict(entry))
+                with self._cache_lock:
+                    self._cache.append(asdict(entry))
+                    if self._is_in_progress(entry.receipt_status) and not entry.tx_hash:
+                        self._pending_receipt_traces.add(trace_id)
                 logger.info(
                     "Committed on-chain ✅ block=%s batch=%s trace=%s",
                     entry.block_height,
@@ -192,9 +393,11 @@ class Weilchain:
             except Exception as exc:
                 self._last_error = str(exc)
                 logger.warning("On-chain commit failed, entry stored locally: %s", exc)
-                self._cache.append(asdict(entry))
+                with self._cache_lock:
+                    self._cache.append(asdict(entry))
         else:
-            self._cache.append(asdict(entry))
+            with self._cache_lock:
+                self._cache.append(asdict(entry))
             logger.info("WeilChain offline - entry cached locally: %s", trace_id)
 
         self._cache_time = 0.0
@@ -202,12 +405,14 @@ class Weilchain:
 
     def get_all(self) -> list[dict]:
         now = time.time()
-        if now - self._cache_time <= self._cache_ttl_seconds:
-            return [dict(e) for e in reversed(self._cache)]
+        with self._cache_lock:
+            if now - self._cache_time <= self._cache_ttl_seconds:
+                return [dict(e) for e in reversed(self._cache)]
 
         # On-chain reads can be added later via SDK query APIs.
-        self._cache_time = now
-        return [dict(e) for e in reversed(self._cache)]
+        with self._cache_lock:
+            self._cache_time = now
+            return [dict(e) for e in reversed(self._cache)]
 
     def get_by_session(self, session_id: str) -> list[dict]:
         return [e for e in self.get_all() if e.get("session_id") == session_id]

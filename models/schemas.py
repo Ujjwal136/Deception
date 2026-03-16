@@ -50,10 +50,20 @@ class FirewallEgressResponse(BaseModel):
 class LedgerEntry(BaseModel):
     trace_id: str
     session_id: str
-    event_type: Literal["BLOCK", "REDACT"]
+    event_type: Literal["BLOCK", "REDACT", "INGRESS_BLOCK", "INGRESS_REDACT", "EGRESS_REDACT"]
     threat_type: str
-    timestamp: float
-    hash: str
+    timestamp_utc: str
+    weilchain_hash: str
+    encrypted_fields: list[str] = Field(default_factory=list)
+    redacted_fields: list[str] = Field(default_factory=list)
+    layer_used: str = ""
+    confidence: float = 0.0
+    block_height: str = ""
+    batch_id: str = ""
+    tx_idx: str = ""
+    tx_hash: str = ""
+    receipt_status: str = ""
+    onchain: bool = False
 
 
 class HealthResponse(BaseModel):
