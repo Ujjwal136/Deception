@@ -81,7 +81,22 @@ Typical protected entities include Aadhaar, PAN, IFSC, account numbers, phone nu
 
 File: agents/managing_agent.py
 
-The managing agent converts user intent into SQL using configured LLM provider (or mock mode), then executes only after validation in the DB layer.
+The managing agent converts user intent into SQL using provider-aware routing, then executes only after validation in the DB layer.
+
+Current routing behavior:
+
+- If OPENAI_API_KEY is present, OpenAI is used for SQL planning
+- Else if ANTHROPIC_API_KEY is present, Anthropic is used
+- Else mock planner is used
+- In automated tests, TEST_MODE=true (or PYTEST_CURRENT_TEST) forces mock mode
+
+General-question bypass:
+
+- Intents that are general banking/policy/process questions are detected before SQL planning
+- These requests skip DB access and return success with:
+  - sql_executed = "N/A - general question"
+  - raw_data = []
+  - row_count = 0
 
 Hard safety constraints:
 
@@ -119,6 +134,15 @@ Supports:
 - openai
 - anthropic
 - mock
+
+Current routing behavior mirrors the Managing Agent:
+
+- OPENAI_API_KEY present -> OpenAI
+- Else ANTHROPIC_API_KEY present -> Anthropic
+- Else mock
+- TEST_MODE=true (or PYTEST_CURRENT_TEST) forces mock mode for tests
+
+General questions (no DB rows) are answered with a dedicated banking-assistant prompt instead of returning a "no data found" response.
 
 ## API Endpoints
 
@@ -238,6 +262,12 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+If your local environment does not already have the OpenAI SDK, install it once:
+
+```powershell
+pip install openai
+```
+
 ### 3) Configure environment
 
 ```powershell
@@ -267,6 +297,7 @@ Defined in config.py and .env.example.
 - LLM_MODEL
 - OPENAI_API_KEY
 - ANTHROPIC_API_KEY
+- TEST_MODE (optional, set true to force mock behavior in tests)
 
 ### Cryptography / Audit
 
@@ -282,11 +313,10 @@ Defined in config.py and .env.example.
 - REDACTOR_MODEL_PATH
 - NER_MODEL_PATH
 - DATABASE_PATH
-- WEILCHAIN_DB_PATH
+- WEIL_KEY_PATH
 
 Notes:
 
-- WEILCHAIN_DB_PATH is retained for compatibility, but current Weilchain backend is applet-first with in-memory fallback.
 - If WEIL_KEY_PATH or SDK is missing, commits are cached locally and service remains operational.
 
 ## Training
@@ -404,8 +434,10 @@ Look at health.weilchain fields (status, sdk_available, key_configured, error).
 
 ### LLM calls are not using provider
 
-- Confirm LLM_PROVIDER and corresponding API key are set
-- In absence of valid key/provider, system intentionally falls back to mock behavior
+- OPENAI_API_KEY takes precedence when present
+- If OPENAI_API_KEY is not set, ANTHROPIC_API_KEY is used if available
+- If neither key exists, system falls back to mock behavior
+- In tests, TEST_MODE=true intentionally forces mock behavior
 
 ### Models not loaded
 
